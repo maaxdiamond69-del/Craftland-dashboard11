@@ -8,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, W
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select, delete
+from sqlalchemy import func, select, delete, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -589,17 +589,42 @@ def agent_refill(data: RefillIn, bot: Bot = Depends(agent_bot), db: Session = De
         return {"ok": True, "refilled": 0, "accounts": {}}
     with _stock_lock:
         bot = db.merge(bot)
+        keep = (
+            select(StockAccount.id)
+            .where(StockAccount.status == "assigned", StockAccount.bot_id == bot.id)
+            .order_by(StockAccount.id)
+            .limit(REFILL_BATCH)
+        )
+        db.execute(
+            update(StockAccount)
+            .where(
+                StockAccount.status == "assigned",
+                StockAccount.bot_id == bot.id,
+                StockAccount.id.not_in(keep),
+            )
+            .values(status="available", bot_id=None, assigned_at=None)
+        )
         rows = db.scalars(
-            select(StockAccount).where(StockAccount.status == "available").order_by(StockAccount.id).limit(REFILL_BATCH)
+            select(StockAccount).where(StockAccount.id.in_(keep))
+        ).all()
+        if rows:
+            accounts = {row.uid: row.secret for row in rows}
+            add_log(db, bot, "SYSTEM", "refill", f"resent {len(accounts)} accounts already assigned to this bot")
+            db.commit()
+            return {"ok": True, "refilled": len(accounts), "accounts": accounts}
+        ids = db.scalars(
+            select(StockAccount.id).where(StockAccount.status == "available").order_by(StockAccount.id).limit(REFILL_BATCH)
         ).all()
         accounts = {}
-        now = utcnow()
-        for row in rows:
-            row.status = "assigned"
-            row.bot_id = bot.id
-            row.assigned_at = now
-            accounts[row.uid] = row.secret
-        if accounts:
+        if ids:
+            now = utcnow()
+            db.execute(
+                update(StockAccount)
+                .where(StockAccount.id.in_(ids))
+                .values(status="assigned", bot_id=bot.id, assigned_at=now)
+            )
+            rows = db.scalars(select(StockAccount).where(StockAccount.id.in_(ids))).all()
+            accounts = {row.uid: row.secret for row in rows}
             add_log(db, bot, "SYSTEM", "refill", f"assigned {len(accounts)} accounts from stock")
         db.commit()
     return {"ok": True, "refilled": len(accounts), "accounts": accounts}
